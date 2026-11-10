@@ -473,10 +473,12 @@ class VideoPlayerWidget(ttk.Frame):
             command=lambda: self.skip_frames(5),
         )
         self.btn_forward.pack(side=tk.LEFT, padx=2)
+
         self.lbl_status = ttk.Label(
-            btn_frame, text="No video loaded"
+            self, text="No video loaded",
+            anchor=tk.W,
         )
-        self.lbl_status.pack(side=tk.LEFT, padx=8)
+        self.lbl_status.pack(fill=tk.X, pady=(2, 0))
 
     def load_video(self, path: Path):
         """Load an MP4 file. Must be called from the main thread."""
@@ -845,6 +847,9 @@ class ControlPanel(ttk.Frame):
             "This cannot be undone.",
         ):
             return
+        # Release the video file handle before deleting
+        self.app.player.stop()
+
         for p_str in paths:
             p = Path(p_str)
             try:

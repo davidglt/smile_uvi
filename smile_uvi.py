@@ -440,10 +440,26 @@ class VideoPlayerWidget(ttk.Frame):
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, pady=(4, 0))
-        self.btn_play = ttk.Button(
-            btn_frame, text="Play", command=self.toggle_play,
+        self.btn_stop = ttk.Button(
+            btn_frame, text="Stop",
+            command=self.stop_playback,
         )
-        self.btn_play.pack(side=tk.LEFT, padx=4)
+        self.btn_stop.pack(side=tk.LEFT, padx=2)
+        self.btn_play = ttk.Button(
+            btn_frame, text="Play",
+            command=self.toggle_play,
+        )
+        self.btn_play.pack(side=tk.LEFT, padx=2)
+        self.btn_rewind = ttk.Button(
+            btn_frame, text="|<",
+            command=lambda: self.skip_frames(-5),
+        )
+        self.btn_rewind.pack(side=tk.LEFT, padx=2)
+        self.btn_forward = ttk.Button(
+            btn_frame, text=">|",
+            command=lambda: self.skip_frames(5),
+        )
+        self.btn_forward.pack(side=tk.LEFT, padx=2)
         self.lbl_status = ttk.Label(
             btn_frame, text="No video loaded"
         )
@@ -474,7 +490,7 @@ class VideoPlayerWidget(ttk.Frame):
         if self._video_path is None:
             return
         if self._playing:
-            self.stop()
+            self.stop_playback()
         else:
             if self._cap is None:
                 self._cap = cv2.VideoCapture(
@@ -486,8 +502,18 @@ class VideoPlayerWidget(ttk.Frame):
                     )
                     self._cap = None
                     return
+            current = int(
+                self._cap.get(cv2.CAP_PROP_POS_FRAMES)
+            )
+            total = int(
+                self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            )
+            if current >= total - 1:
+                self._cap.set(
+                    cv2.CAP_PROP_POS_FRAMES, 0
+                )
             self._playing = True
-            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.btn_play.config(text="Pause")
             self._tick()
 
     def stop(self):
@@ -498,8 +524,50 @@ class VideoPlayerWidget(ttk.Frame):
             self._after_id = None
         if self._cap:
             self._cap.release()
+            self._cap = None
+        self.btn_play.config(text="Play")
         self.canvas.delete("all")
         self._photo = None
+
+    def stop_playback(self):
+        """Stop the playback loop but keep the current frame visible."""
+        self._playing = False
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.btn_play.config(text="Play")
+
+    def skip_frames(self, n: int):
+        """Skip forward or backward by n frames."""
+        if self._cap is None or self._video_path is None:
+            return
+        self._playing = False
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        current = int(
+            self._cap.get(cv2.CAP_PROP_POS_FRAMES)
+        )
+        total = int(
+            self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        )
+        target = max(0, min(total - 1, current + n))
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        ret, frame = self._cap.read()
+        if not ret:
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(
+            frame, (self._width, self._height),
+            interpolation=cv2.INTER_AREA,
+        )
+        img = Image.fromarray(frame)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(
+            self._width // 2, self._height // 2,
+            image=self._photo, anchor=tk.CENTER,
+        )
 
     def _tick(self):
         """Advance one frame and schedule the next tick."""
@@ -507,7 +575,7 @@ class VideoPlayerWidget(ttk.Frame):
             return
         ret, frame = self._cap.read()
         if not ret:
-            self.stop()
+            self.stop_playback()
             return
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(
@@ -715,17 +783,13 @@ class ControlPanel(ttk.Frame):
         self.tree.item(row, values=values)
 
     def _on_delete(self):
-        """Delete selected video files from disk and the catalog."""
-        sel = self.tree.selection()
-        if not sel:
+        """Delete checked video files from disk and refresh."""
+        if not self._marked:
+            messagebox.showinfo(
+                "Delete", "No videos checked."
+            )
             return
-        paths = []
-        for item_id in sel:
-            item = self.tree.item(item_id)
-            if item["tags"]:
-                paths.append(Path(str(item["tags"][0])))
-        if not paths:
-            return
+        paths = [Path(p) for p in self._marked]
         if not messagebox.askyesno(
             "Confirm Delete",
             f"Delete {len(paths)} video(s)?\n"
@@ -737,6 +801,7 @@ class ControlPanel(ttk.Frame):
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
+        self._marked.clear()
         self.refresh_catalog()
 
 

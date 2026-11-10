@@ -763,11 +763,10 @@ class SmileUviApp:
                 ),
             )
         except Exception as e:
+            error_msg = f"ERROR: {e}"
             self.root.after(
                 0,
-                lambda: self.panel.set_status(
-                    f"ERROR: {e}"
-                ),
+                lambda: self.panel.set_status(error_msg),
             )
         finally:
             self._busy = False
@@ -801,11 +800,10 @@ class SmileUviApp:
                 ),
             )
         except Exception as e:
+            error_msg = f"ERROR: {e}"
             self.root.after(
                 0,
-                lambda: self.panel.set_status(
-                    f"ERROR: {e}"
-                ),
+                lambda: self.panel.set_status(error_msg),
             )
         finally:
             self._busy = False

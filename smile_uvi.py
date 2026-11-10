@@ -437,9 +437,22 @@ class VideoPlayerWidget(ttk.Frame):
         self._height = height
         self._photo = None
         self._video_path = None
+        self._total_frames = 0
 
+        # Seek bar
+        seek_frame = ttk.Frame(self)
+        seek_frame.pack(fill=tk.X, pady=(4, 0))
+        self.seek_bar = ttk.Scale(
+            seek_frame, from_=0, to=100,
+            orient=tk.HORIZONTAL,
+            command=self._on_seek,
+        )
+        self.seek_bar.pack(fill=tk.X, padx=4)
+        self.seek_bar.set(0)
+
+        # Transport buttons
         btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill=tk.X, pady=(4, 0))
+        btn_frame.pack(fill=tk.X, pady=(2, 0))
         self.btn_stop = ttk.Button(
             btn_frame, text="Stop",
             command=self.stop_playback,
@@ -484,6 +497,9 @@ class VideoPlayerWidget(ttk.Frame):
         self.lbl_status.config(
             text=f"{path.name}  ({frames}f @ {fps:.1f}fps)"
         )
+        self._total_frames = frames
+        self.seek_bar.config(from_=0, to=max(frames - 1, 1))
+        self.seek_bar.set(0)
 
     def toggle_play(self):
         """Toggle play/pause of the loaded video."""
@@ -568,6 +584,29 @@ class VideoPlayerWidget(ttk.Frame):
             self._width // 2, self._height // 2,
             image=self._photo, anchor=tk.CENTER,
         )
+        self.seek_bar.set(target)
+
+    def _on_seek(self, value):
+        """Seek to the frame indicated by the slider."""
+        if self._cap is None or self._total_frames == 0:
+            return
+        target = int(float(value))
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        ret, frame = self._cap.read()
+        if not ret:
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(
+            frame, (self._width, self._height),
+            interpolation=cv2.INTER_AREA,
+        )
+        img = Image.fromarray(frame)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(
+            self._width // 2, self._height // 2,
+            image=self._photo, anchor=tk.CENTER,
+        )
 
     def _tick(self):
         """Advance one frame and schedule the next tick."""
@@ -589,6 +628,8 @@ class VideoPlayerWidget(ttk.Frame):
             self._width // 2, self._height // 2,
             image=self._photo, anchor=tk.CENTER,
         )
+        pos = int(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
+        self.seek_bar.set(pos)
         delay = int(
             1000 / max(self._cap.get(cv2.CAP_PROP_FPS), 1)
         )
@@ -769,9 +810,11 @@ class ControlPanel(ttk.Frame):
         row = self.tree.identify_row(event.y)
         if not row:
             return
+        # Deselect to avoid triggering _on_catalog_select
+        self.tree.selection_remove(row)
         item = self.tree.item(row)
         values = list(item["values"])
-        path_str = item["tags"][0] if item["tags"] else None
+        path_str = str(item["tags"][0]) if item["tags"] else None
         if values[0] == "\u2611":
             values[0] = "\u2610"
             if path_str:
@@ -783,24 +826,35 @@ class ControlPanel(ttk.Frame):
         self.tree.item(row, values=values)
 
     def _on_delete(self):
-        """Delete checked video files from disk and refresh."""
-        if not self._marked:
+        """Delete checked or selected video files from disk."""
+        paths = set(self._marked)
+        sel = self.tree.selection()
+        for item_id in sel:
+            item = self.tree.item(item_id)
+            if item["tags"]:
+                paths.add(str(item["tags"][0]))
+        if not paths:
             messagebox.showinfo(
-                "Delete", "No videos checked."
+                "Delete",
+                "Check or select a video first.",
             )
             return
-        paths = [Path(p) for p in self._marked]
         if not messagebox.askyesno(
             "Confirm Delete",
             f"Delete {len(paths)} video(s)?\n"
             "This cannot be undone.",
         ):
             return
-        for p in paths:
+        for p_str in paths:
+            p = Path(p_str)
             try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
+                if p.is_file():
+                    p.unlink()
+            except OSError as e:
+                messagebox.showerror(
+                    "Delete",
+                    f"Failed to delete {p.name}:\n{e}",
+                )
         self._marked.clear()
         self.refresh_catalog()
 

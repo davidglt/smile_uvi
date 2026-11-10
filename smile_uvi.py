@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Download daily SMILE UVI samples and optionally create an MP4 video."""
+"""SMILE UVI GUI: download daily samples and play the MP4 video."""
 
-import argparse
 import csv
 import io
-import shutil
 import subprocess
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import cv2
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+import tkinter as tk
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 from requests.adapters import HTTPAdapter
+from tkinter import ttk, messagebox
 from urllib3.util.retry import Retry
 
 
@@ -49,92 +51,6 @@ def make_session():
     return session
 
 
-def query_products(session, start, end):
-    start_text = start.strftime("%Y-%m-%dT%H:%M:%S")
-    end_text = end.strftime("%Y-%m-%dT%H:%M:%S")
-
-    query = f"""
-        SELECT filepath, filename, begin_time, item_version
-        FROM {TABLE}
-        WHERE instrument_name = 'UVI'
-          AND filename LIKE '%.png'
-          AND begin_time >= {adql_string(start_text)}
-          AND begin_time < {adql_string(end_text)}
-        ORDER BY begin_time ASC, filename ASC
-    """
-
-    response = session.get(
-        f"{BASE_URL}/tap/sync",
-        params={
-            "REQUEST": "doQuery",
-            "LANG": "ADQL",
-            "FORMAT": "csv",
-            "MAXREC": MAX_RECORDS,
-            "QUERY": query,
-        },
-        timeout=(30, 180),
-    )
-    response.raise_for_status()
-
-    reader = csv.DictReader(
-        io.StringIO(response.text.lstrip("\ufeff"))
-    )
-    required = {"filepath", "filename", "begin_time", "item_version"}
-
-    if not required.issubset(reader.fieldnames or []):
-        raise RuntimeError(
-            "Unexpected TAP response:\n" + response.text[:1500]
-        )
-
-    products = list(reader)
-    if len(products) >= MAX_RECORDS:
-        raise RuntimeError(
-            "Possible TAP result truncation. Refine the query."
-        )
-
-    return products
-
-
-def select_samples(products, start, sample_count, prefix):
-    selected = {}
-
-    for product in products:
-        if prefix and not product["filename"].startswith(prefix):
-            continue
-
-        timestamp = parse_timestamp(product["begin_time"])
-        elapsed = timestamp - start
-        elapsed_us = (
-            elapsed.days * DAY_SECONDS * 1_000_000
-            + elapsed.seconds * 1_000_000
-            + elapsed.microseconds
-        )
-
-        if not 0 <= elapsed_us < DAY_SECONDS * 1_000_000:
-            continue
-
-        slot = (
-            elapsed_us * sample_count
-            // (DAY_SECONDS * 1_000_000)
-        )
-
-        previous = selected.get(slot)
-        if previous is None:
-            selected[slot] = product
-            continue
-
-        previous_time = parse_timestamp(previous["begin_time"])
-        if timestamp < previous_time:
-            selected[slot] = product
-        elif timestamp == previous_time:
-            if (product["item_version"] or "") > (
-                previous["item_version"] or ""
-            ):
-                selected[slot] = product
-
-    return selected
-
-
 def valid_png(path):
     if not path.is_file():
         return False
@@ -147,76 +63,6 @@ def valid_png(path):
         return True
     except (OSError, SyntaxError, ValueError):
         return False
-
-
-def download_product(session, product, originals_dir):
-    filename = product["filename"]
-    if (
-        not filename
-        or "/" in filename
-        or "\\" in filename
-        or ":" in filename
-        or filename in {".", ".."}
-    ):
-        raise RuntimeError(f"Unexpected filename: {filename!r}")
-
-    destination = originals_dir / filename
-    if valid_png(destination):
-        print(f"  Cached: {filename}", flush=True)
-        return destination
-
-    query = f"""
-        SELECT filepath, filename
-        FROM {TABLE}
-        WHERE filepath = {adql_string(product["filepath"])}
-          AND filename = {adql_string(filename)}
-    """
-
-    temporary = destination.with_name(destination.name + ".part")
-
-    try:
-        with session.get(
-            f"{BASE_URL}/data",
-            params={
-                "retrieval_type": "PRODUCT",
-                "QUERY": query,
-            },
-            stream=True,
-            timeout=(30, 300),
-        ) as response:
-            response.raise_for_status()
-            chunks = response.iter_content(chunk_size=1024 * 1024)
-
-            first_bytes = b""
-            while len(first_bytes) < len(PNG_SIGNATURE):
-                chunk = next(chunks, b"")
-                if not chunk:
-                    break
-                first_bytes += chunk
-
-            if not first_bytes.startswith(PNG_SIGNATURE):
-                raise RuntimeError(
-                    f"Expected a PNG for {filename}.\n"
-                    f"Content-Type: "
-                    f"{response.headers.get('Content-Type')}\n"
-                    f"First bytes: {first_bytes[:120]!r}"
-                )
-
-            with temporary.open("wb") as output:
-                output.write(first_bytes)
-                for chunk in chunks:
-                    if chunk:
-                        output.write(chunk)
-
-        if not valid_png(temporary):
-            raise RuntimeError(f"Invalid PNG: {filename}")
-
-        temporary.replace(destination)
-        print(f"  Downloaded: {filename}", flush=True)
-        return destination
-
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def get_font(size):
@@ -240,306 +86,731 @@ def draw_fitted_text(draw, position, text, font, max_width):
     draw.text(position, text, fill="white", font=font)
 
 
-def render_frame(
-    source,
-    destination,
-    slot_start,
-    slot_end,
-    product,
-    size,
-):
-    width, height = size
-    footer_height = 110
-    frame = Image.new("RGB", size, "black")
+class SmileUviData:
+    """Data layer: query, download, cache, render, and video creation."""
 
-    if source is not None:
-        with Image.open(source) as original:
-            rgba = original.convert("RGBA")
-            background = Image.new("RGBA", rgba.size, "black")
-            background.alpha_composite(rgba)
+    def __init__(self, output_root: Path):
+        self.output_root = output_root
 
-            fitted = ImageOps.contain(
-                background.convert("RGB"),
-                (width, height - footer_height),
-                Image.Resampling.LANCZOS,
-            )
+    def day_dir(self, day: date) -> Path:
+        """Return the directory for a given day (YYYYMMDD format)."""
+        return self.output_root / day.strftime("%Y%m%d")
 
-        frame.paste(
-            fitted,
-            (
-                (width - fitted.width) // 2,
-                (height - footer_height - fitted.height) // 2,
-            ),
+    def originals_dir(self, day: date) -> Path:
+        """Return the originals sub-directory for a day."""
+        return self.day_dir(day) / "originals"
+
+    def frames_dir(self, day: date, samples: int) -> Path:
+        """Return the frames sub-directory for a day and sample count."""
+        return self.day_dir(day) / f"frames_{samples}samples"
+
+    def manifest_path(self, day: date, samples: int) -> Path:
+        """Return the manifest CSV path for a day and sample count."""
+        return self.day_dir(day) / f"manifest_{samples}samples.csv"
+
+    def video_path(self, day: date, samples: int, fps: int) -> Path:
+        """Return the MP4 video path for a day, samples, and fps."""
+        return self.day_dir(day) / (
+            f"smile_uvi_{day.strftime('%Y%m%d')}_"
+            f"{samples}samples_{fps}fps.mp4"
         )
 
-    draw = ImageDraw.Draw(frame)
+    def query_products(self, session, start, end) -> list:
+        """Query the TAP service for UVI products in a time range."""
+        start_text = start.strftime("%Y-%m-%dT%H:%M:%S")
+        end_text = end.strftime("%Y-%m-%dT%H:%M:%S")
 
-    if source is None:
-        draw.text(
-            (width // 2, (height - footer_height) // 2),
-            "NO DATA",
-            fill="white",
-            font=get_font(44),
-            anchor="mm",
+        query = f"""
+            SELECT filepath, filename, begin_time, item_version
+            FROM {TABLE}
+            WHERE instrument_name = 'UVI'
+              AND filename LIKE '%.png'
+              AND begin_time >= {adql_string(start_text)}
+              AND begin_time < {adql_string(end_text)}
+            ORDER BY begin_time ASC, filename ASC
+        """
+
+        response = session.get(
+            f"{BASE_URL}/tap/sync",
+            params={
+                "REQUEST": "doQuery",
+                "LANG": "ADQL",
+                "FORMAT": "csv",
+                "MAXREC": MAX_RECORDS,
+                "QUERY": query,
+            },
+            timeout=(30, 180),
         )
+        response.raise_for_status()
 
-    label = (
-        f'{slot_start.strftime("%Y-%m-%d")} UTC | '
-        f'{slot_start.strftime("%H:%M:%S")} - '
-        f'{slot_end.strftime("%H:%M:%S")}'
-    )
-    draw_fitted_text(
-        draw, (15, height - 100), label,
-        get_font(24), width - 30,
-    )
-
-    observation = (
-        f'Observation: {product["begin_time"]}'
-        if product
-        else "No observation available in this time slot"
-    )
-    draw_fitted_text(
-        draw, (15, height - 65), observation,
-        get_font(20), width - 30,
-    )
-
-    filename = product["filename"] if product else ""
-    draw_fitted_text(
-        draw, (15, height - 33), filename,
-        get_font(18), width - 30,
-    )
-
-    temporary = destination.with_name(destination.name + ".part")
-    try:
-        frame.save(temporary, format="PNG", compress_level=1)
-        temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def create_video(frames_dir, destination, sample_count, fps):
-    temporary = destination.with_name(
-        destination.stem + ".part.mp4"
-    )
-
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-framerate", str(fps),
-        "-start_number", "0",
-        "-i", str(frames_dir / "frame_%06d.png"),
-        "-frames:v", str(sample_count),
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        str(temporary),
-    ]
-
-    try:
-        subprocess.run(command, check=True)
-
-        if not temporary.is_file() or temporary.stat().st_size == 0:
-            raise RuntimeError("FFmpeg did not create a valid output file.")
-
-        temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Download equally spaced daily SMILE UVI samples "
-            "and optionally create an MP4 video."
+        reader = csv.DictReader(
+            io.StringIO(response.text.lstrip("\ufeff"))
         )
-    )
-    parser.add_argument(
-        "day", type=date.fromisoformat,
-        help="UTC date in YYYY-MM-DD format.",
-    )
-    parser.add_argument(
-        "--samples", type=int, default=24,
-        help="Number of daily time slots (1 to 86400). Default: 24.",
-    )
-    parser.add_argument(
-        "--fps", type=int, default=1,
-        help="Video frames per second. Default: 1.",
-    )
-    parser.add_argument(
-        "--output", type=Path, default=Path("data"),
-        help="Output root directory. Default: ./data.",
-    )
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=1080)
-    parser.add_argument(
-        "--prefix",
-        default="SMILE_UVI_QL_AURORA_",
-        help="Filename prefix filter. Default: SMILE_UVI_QL_AURORA_.",
-    )
-    parser.add_argument(
-        "--no-video", action="store_true",
-        help="Download originals and create frames without an MP4.",
-    )
+        required = {
+            "filepath", "filename", "begin_time", "item_version"
+        }
 
-    args = parser.parse_args()
-
-    if not 1 <= args.samples <= 86400:
-        parser.error("--samples must be between 1 and 86400")
-    if args.fps <= 0:
-        parser.error("--fps must be positive")
-    if args.width < 320 or args.height < 240:
-        parser.error("Minimum output size is 320x240")
-    if args.width % 2 or args.height % 2:
-        parser.error("Width and height must be even")
-    if not args.no_video and shutil.which("ffmpeg") is None:
-        parser.error(
-            "FFmpeg is not available in PATH. "
-            "Install FFmpeg or use --no-video."
-        )
-
-    return args
-
-
-def main():
-    args = parse_arguments()
-
-    start = datetime.combine(
-        args.day,
-        datetime.min.time(),
-        tzinfo=timezone.utc,
-    )
-    end = start + timedelta(days=1)
-
-    day_dir = args.output / args.day.isoformat()
-    originals_dir = day_dir / "originals"
-    frames_dir = day_dir / f"frames_{args.samples}samples"
-    manifest_path = day_dir / f"manifest_{args.samples}samples.csv"
-    video_path = day_dir / (
-        f"smile_uvi_{args.day.isoformat()}_"
-        f"{args.samples}samples_{args.fps}fps.mp4"
-    )
-
-    originals_dir.mkdir(parents=True, exist_ok=True)
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"UTC date: {args.day}")
-    print(f"Daily time slots: {args.samples}")
-    print(f"Slot duration: {DAY_SECONDS / args.samples:.6f} seconds")
-    print(f"Output directory: {day_dir.resolve()}")
-
-    with make_session() as session:
-        products = query_products(session, start, end)
-        selected = select_samples(
-            products, start, args.samples, args.prefix
-        )
-
-        print(f"Catalogue rows: {len(products)}")
-        print(f"Available slots: {len(selected)}/{args.samples}")
-        print(f"Missing slots: {args.samples - len(selected)}")
-
-        if not selected:
+        if not required.issubset(reader.fieldnames or []):
             raise RuntimeError(
-                "No matching products found. "
-                "Check the date, prefix and access permissions."
+                "Unexpected TAP response:\n" + response.text[:1500]
             )
 
-        with manifest_path.open(
-            "w", newline="", encoding="utf-8"
-        ) as output:
-            writer = csv.writer(output)
-            writer.writerow([
-                "slot_index",
-                "slot_start_utc",
-                "slot_end_utc",
-                "status",
-                "observation_time",
-                "filename",
-                "local_file",
-                "frame_file",
-            ])
+        products = list(reader)
+        if len(products) >= MAX_RECORDS:
+            raise RuntimeError(
+                "Possible TAP result truncation. Refine the query."
+            )
 
-            for slot in range(args.samples):
-                slot_start = start + timedelta(
-                    seconds=slot * DAY_SECONDS / args.samples
+        return products
+
+    def select_samples(
+        self, products, start, sample_count, prefix
+    ) -> dict:
+        """Select one product per time slot from the product list."""
+        selected = {}
+
+        for product in products:
+            if prefix and not product["filename"].startswith(prefix):
+                continue
+
+            timestamp = parse_timestamp(product["begin_time"])
+            elapsed = timestamp - start
+            elapsed_us = (
+                elapsed.days * DAY_SECONDS * 1_000_000
+                + elapsed.seconds * 1_000_000
+                + elapsed.microseconds
+            )
+
+            if not 0 <= elapsed_us < DAY_SECONDS * 1_000_000:
+                continue
+
+            slot = (
+                elapsed_us * sample_count
+                // (DAY_SECONDS * 1_000_000)
+            )
+
+            previous = selected.get(slot)
+            if previous is None:
+                selected[slot] = product
+                continue
+
+            previous_time = parse_timestamp(previous["begin_time"])
+            if timestamp < previous_time:
+                selected[slot] = product
+            elif timestamp == previous_time:
+                if (product["item_version"] or "") > (
+                    previous["item_version"] or ""
+                ):
+                    selected[slot] = product
+
+        return selected
+
+    def download_product(
+        self, session, product, originals_dir
+    ) -> Path:
+        """Download a single product, using cache if valid."""
+        filename = product["filename"]
+        if (
+            not filename
+            or "/" in filename
+            or "\\" in filename
+            or ":" in filename
+            or filename in {".", ".."}
+        ):
+            raise RuntimeError(f"Unexpected filename: {filename!r}")
+
+        destination = originals_dir / filename
+        if valid_png(destination):
+            return destination
+
+        query = f"""
+            SELECT filepath, filename
+            FROM {TABLE}
+            WHERE filepath = {adql_string(product["filepath"])}
+              AND filename = {adql_string(filename)}
+        """
+
+        temporary = destination.with_name(destination.name + ".part")
+
+        try:
+            with session.get(
+                f"{BASE_URL}/data",
+                params={
+                    "retrieval_type": "PRODUCT",
+                    "QUERY": query,
+                },
+                stream=True,
+                timeout=(30, 300),
+            ) as response:
+                response.raise_for_status()
+                chunks = response.iter_content(
+                    chunk_size=1024 * 1024
                 )
-                slot_end = start + timedelta(
-                    seconds=(slot + 1) * DAY_SECONDS / args.samples
-                )
-                product = selected.get(slot)
-                source = None
-                frame_path = frames_dir / f"frame_{slot:06d}.png"
 
-                print(
-                    f"[{slot + 1}/{args.samples}] "
-                    f"{slot_start.isoformat()}",
-                    flush=True,
-                )
+                first_bytes = b""
+                while len(first_bytes) < len(PNG_SIGNATURE):
+                    chunk = next(chunks, b"")
+                    if not chunk:
+                        break
+                    first_bytes += chunk
 
-                try:
-                    if product is not None:
-                        source = download_product(
-                            session, product, originals_dir
-                        )
-                    else:
-                        print("  No observation in this slot.", flush=True)
-
-                    render_frame(
-                        source,
-                        frame_path,
-                        slot_start,
-                        slot_end,
-                        product,
-                        (args.width, args.height),
+                if not first_bytes.startswith(PNG_SIGNATURE):
+                    raise RuntimeError(
+                        f"Expected a PNG for {filename}.\n"
+                        f"Content-Type: "
+                        f"{response.headers.get('Content-Type')}\n"
+                        f"First bytes: {first_bytes[:120]!r}"
                     )
 
-                except Exception:
-                    writer.writerow([
-                        slot,
-                        slot_start.isoformat(),
-                        slot_end.isoformat(),
-                        "error",
-                        product["begin_time"] if product else "",
-                        product["filename"] if product else "",
-                        str(source) if source else "",
-                        "",
-                    ])
-                    output.flush()
-                    raise
+                with temporary.open("wb") as output:
+                    output.write(first_bytes)
+                    for chunk in chunks:
+                        if chunk:
+                            output.write(chunk)
 
-                writer.writerow([
-                    slot,
-                    slot_start.isoformat(),
-                    slot_end.isoformat(),
-                    "available" if source else "missing",
-                    product["begin_time"] if product else "",
-                    product["filename"] if product else "",
-                    str(source) if source else "",
-                    str(frame_path),
-                ])
-                output.flush()
+            if not valid_png(temporary):
+                raise RuntimeError(f"Invalid PNG: {filename}")
 
-    print(f"Manifest: {manifest_path}")
-    print(f"Original images: {originals_dir}")
-    print(f"Frames: {frames_dir}")
+            temporary.replace(destination)
+            return destination
 
-    if args.no_video:
-        print("Video generation skipped.")
-        return
+        finally:
+            temporary.unlink(missing_ok=True)
 
-    create_video(
-        frames_dir, video_path, args.samples, args.fps
-    )
-    print(f"Video created: {video_path}")
-    print(f"Video duration: {args.samples / args.fps:.2f} seconds")
+    def render_frame(
+        self,
+        source,
+        destination,
+        slot_start,
+        slot_end,
+        product,
+        size,
+    ) -> None:
+        """Render a single frame with image and metadata overlay."""
+        width, height = size
+        footer_height = 110
+        frame = Image.new("RGB", size, "black")
+
+        if source is not None:
+            with Image.open(source) as original:
+                rgba = original.convert("RGBA")
+                background = Image.new(
+                    "RGBA", rgba.size, "black"
+                )
+                background.alpha_composite(rgba)
+
+                fitted = ImageOps.contain(
+                    background.convert("RGB"),
+                    (width, height - footer_height),
+                    Image.Resampling.LANCZOS,
+                )
+
+            frame.paste(
+                fitted,
+                (
+                    (width - fitted.width) // 2,
+                    (height - footer_height
+                     - fitted.height) // 2,
+                ),
+            )
+
+        draw = ImageDraw.Draw(frame)
+
+        if source is None:
+            draw.text(
+                (width // 2, (height - footer_height) // 2),
+                "NO DATA",
+                fill="white",
+                font=get_font(44),
+                anchor="mm",
+            )
+
+        label = (
+            f'{slot_start.strftime("%Y-%m-%d")} UTC | '
+            f'{slot_start.strftime("%H:%M:%S")} - '
+            f'{slot_end.strftime("%H:%M:%S")}'
+        )
+        draw_fitted_text(
+            draw, (15, height - 100), label,
+            get_font(24), width - 30,
+        )
+
+        observation = (
+            f'Observation: {product["begin_time"]}'
+            if product
+            else "No observation available in this time slot"
+        )
+        draw_fitted_text(
+            draw, (15, height - 65), observation,
+            get_font(20), width - 30,
+        )
+
+        filename = product["filename"] if product else ""
+        draw_fitted_text(
+            draw, (15, height - 33), filename,
+            get_font(18), width - 30,
+        )
+
+        temporary = destination.with_name(
+            destination.name + ".part"
+        )
+        try:
+            frame.save(
+                temporary, format="PNG", compress_level=1
+            )
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def create_video(
+        self, frames_dir, destination, sample_count, fps
+    ) -> None:
+        """Create an MP4 video from rendered frames using FFmpeg."""
+        temporary = destination.with_name(
+            destination.stem + ".part.mp4"
+        )
+
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-framerate", str(fps),
+            "-start_number", "0",
+            "-i", str(frames_dir / "frame_%06d.png"),
+            "-frames:v", str(sample_count),
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(temporary),
+        ]
+
+        try:
+            subprocess.run(command, check=True)
+
+            if (
+                not temporary.is_file()
+                or temporary.stat().st_size == 0
+            ):
+                raise RuntimeError(
+                    "FFmpeg did not create a valid output file."
+                )
+
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def get_cached_files(self, day: date, samples: int) -> list:
+        """Return list of valid PNGs already in originals/ for this day."""
+        odir = self.originals_dir(day)
+        if not odir.is_dir():
+            return []
+        return [p for p in sorted(odir.glob("*.png")) if valid_png(p)]
+
+    def get_telemetry(self, products: list) -> list:
+        """Extract telemetry rows from the product list."""
+        return [
+            {
+                "time": p["begin_time"],
+                "file": p["filename"],
+                "version": p.get("item_version", ""),
+            }
+            for p in products
+        ]
+
+
+class VideoPlayerWidget(ttk.Frame):
+    """Plays an MP4 file using OpenCV on a tkinter Canvas."""
+
+    def __init__(self, parent, width=640, height=480):
+        super().__init__(parent)
+        self.canvas = tk.Canvas(
+            self, width=width, height=height,
+            bg="black", highlightthickness=0,
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self._cap = None
+        self._playing = False
+        self._after_id = None
+        self._width = width
+        self._height = height
+        self._photo = None
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill=tk.X, pady=(4, 0))
+        self.btn_play = ttk.Button(
+            btn_frame, text="Play", command=self.toggle_play,
+        )
+        self.btn_play.pack(side=tk.LEFT, padx=4)
+        self.lbl_status = ttk.Label(
+            btn_frame, text="No video loaded"
+        )
+        self.lbl_status.pack(side=tk.LEFT, padx=8)
+
+    def load_video(self, path: Path):
+        """Load an MP4 file. Must be called from the main thread."""
+        self.stop()
+        if not path.is_file():
+            self.lbl_status.config(
+                text=f"Not found: {path.name}"
+            )
+            return
+        self._cap = cv2.VideoCapture(str(path))
+        if not self._cap.isOpened():
+            self.lbl_status.config(text="Failed to open video")
+            self._cap = None
+            return
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.lbl_status.config(
+            text=f"{path.name}  ({frames}f @ {fps:.1f}fps)"
+        )
+
+    def toggle_play(self):
+        """Toggle play/pause of the loaded video."""
+        if self._cap is None:
+            return
+        if self._playing:
+            self.stop()
+        else:
+            self._playing = True
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self._tick()
+
+    def stop(self):
+        """Stop playback and release the video capture."""
+        self._playing = False
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+        self.canvas.delete("all")
+        self._photo = None
+
+    def _tick(self):
+        """Advance one frame and schedule the next tick."""
+        if not self._playing or self._cap is None:
+            return
+        ret, frame = self._cap.read()
+        if not ret:
+            self.stop()
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(
+            frame, (self._width, self._height),
+            interpolation=cv2.INTER_AREA,
+        )
+        img = Image.fromarray(frame)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(
+            self._width // 2, self._height // 2,
+            image=self._photo, anchor=tk.CENTER,
+        )
+        delay = int(
+            1000 / max(self._cap.get(cv2.CAP_PROP_FPS), 1)
+        )
+        self._after_id = self.after(delay, self._tick)
+
+
+class ControlPanel(ttk.Frame):
+    """Right-side form: date, params, telemetry, action buttons."""
+
+    def __init__(self, parent, app: "SmileUviApp"):
+        super().__init__(parent, padding=10)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        """Build all form widgets."""
+        ttk.Label(self, text="Date (YYYY-MM-DD):").pack(
+            anchor=tk.W
+        )
+        self.var_date = tk.StringVar(
+            value=date.today().isoformat()
+        )
+        ttk.Entry(
+            self, textvariable=self.var_date, width=14
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        ttk.Label(self, text="Number of frames:").pack(
+            anchor=tk.W
+        )
+        self.var_samples = tk.IntVar(value=24)
+        ttk.Spinbox(
+            self, from_=1, to=86400,
+            textvariable=self.var_samples, width=10,
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        ttk.Label(self, text="Video FPS:").pack(anchor=tk.W)
+        self.var_fps = tk.IntVar(value=1)
+        ttk.Spinbox(
+            self, from_=1, to=60,
+            textvariable=self.var_fps, width=10,
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        ttk.Label(self, text="Filename prefix:").pack(
+            anchor=tk.W
+        )
+        self.var_prefix = tk.StringVar(
+            value="SMILE_UVI_QL_AURORA_"
+        )
+        ttk.Entry(
+            self, textvariable=self.var_prefix, width=28,
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill=tk.X, pady=(8, 4))
+        self.btn_download = ttk.Button(
+            btn_frame, text="Download",
+            command=self._on_download,
+        )
+        self.btn_download.pack(side=tk.LEFT, padx=4)
+        self.btn_video = ttk.Button(
+            btn_frame, text="Create Video",
+            command=self._on_create_video,
+        )
+        self.btn_video.pack(side=tk.LEFT, padx=4)
+
+        self.var_status = tk.StringVar(value="Ready")
+        ttk.Label(
+            self, textvariable=self.var_status,
+            wraplength=280, justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(8, 4))
+
+        ttk.Label(
+            self, text="Telemetry / Catalogue:"
+        ).pack(anchor=tk.W, pady=(8, 2))
+        self.txt_tel = tk.Text(
+            self, height=12, width=36,
+            font=("Consolas", 9),
+        )
+        scroll = ttk.Scrollbar(
+            self, command=self.txt_tel.yview
+        )
+        self.txt_tel.configure(yscrollcommand=scroll.set)
+        self.txt_tel.pack(
+            side=tk.LEFT, fill=tk.BOTH, expand=True
+        )
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _on_download(self):
+        """Trigger the download workflow."""
+        self.app.start_download()
+
+    def _on_create_video(self):
+        """Trigger the video creation workflow."""
+        self.app.start_video()
+
+    def set_status(self, text: str):
+        """Update the status label text."""
+        self.var_status.set(text)
+
+    def set_telemetry(self, rows: list):
+        """Populate the telemetry text widget with rows."""
+        self.txt_tel.delete("1.0", tk.END)
+        for r in rows:
+            self.txt_tel.insert(
+                tk.END,
+                f"{r['time']}  {r['file']}  "
+                f"v{r['version']}\n",
+            )
+
+
+class SmileUviApp:
+    """Main application window wiring all components together."""
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("SMILE UVI - Daily Sampler")
+        self.root.geometry("1100x700")
+        self.root.minsize(900, 550)
+
+        self.data = SmileUviData(output_root=Path("data"))
+
+        main = ttk.PanedWindow(
+            self.root, orient=tk.HORIZONTAL,
+        )
+        main.pack(fill=tk.BOTH, expand=True)
+
+        self.player = VideoPlayerWidget(
+            main, width=640, height=480
+        )
+        main.add(self.player, weight=3)
+
+        self.panel = ControlPanel(main, self)
+        main.add(self.panel, weight=2)
+
+        self._busy = False
+
+    def run(self):
+        """Start the tkinter main loop."""
+        self.root.mainloop()
+
+    def start_download(self):
+        """Begin the download workflow in a background thread."""
+        if self._busy:
+            return
+        self._busy = True
+        self.panel.set_status("Downloading...")
+        threading.Thread(
+            target=self._worker_download, daemon=True,
+        ).start()
+
+    def start_video(self):
+        """Begin the video creation workflow in a background thread."""
+        if self._busy:
+            return
+        self._busy = True
+        self.panel.set_status("Creating video...")
+        threading.Thread(
+            target=self._worker_video, daemon=True,
+        ).start()
+
+    def _worker_download(self):
+        """Background worker: query, download, and render frames."""
+        try:
+            day = date.fromisoformat(
+                self.panel.var_date.get()
+            )
+            samples = self.panel.var_samples.get()
+            prefix = self.panel.var_prefix.get()
+
+            start = datetime.combine(
+                day, datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            end = start + timedelta(days=1)
+
+            odir = self.data.originals_dir(day)
+            odir.mkdir(parents=True, exist_ok=True)
+
+            with make_session() as session:
+                products = self.data.query_products(
+                    session, start, end,
+                )
+                selected = self.data.select_samples(
+                    products, start, samples, prefix,
+                )
+
+                self.root.after(
+                    0,
+                    lambda: self.panel.set_telemetry(
+                        self.data.get_telemetry(products),
+                    ),
+                )
+
+                cached = self.data.get_cached_files(
+                    day, samples
+                )
+                self.root.after(
+                    0,
+                    lambda: self.panel.set_status(
+                        f"Catalogue: {len(products)} rows, "
+                        f"slots: {len(selected)}/{samples}, "
+                        f"cached: {len(cached)}",
+                    ),
+                )
+
+                for slot, product in sorted(
+                    selected.items()
+                ):
+                    dest = odir / product["filename"]
+                    if valid_png(dest):
+                        continue
+                    self.data.download_product(
+                        session, product, odir,
+                    )
+
+                fdir = self.data.frames_dir(day, samples)
+                fdir.mkdir(parents=True, exist_ok=True)
+                size = (1280, 1080)
+                for slot in range(samples):
+                    slot_start = start + timedelta(
+                        seconds=(
+                            slot * DAY_SECONDS / samples
+                        ),
+                    )
+                    slot_end = start + timedelta(
+                        seconds=(
+                            (slot + 1) * DAY_SECONDS / samples
+                        ),
+                    )
+                    product = selected.get(slot)
+                    source = None
+                    if product:
+                        src_path = (
+                            odir / product["filename"]
+                        )
+                        if valid_png(src_path):
+                            source = src_path
+                    frame_path = (
+                        fdir / f"frame_{slot:06d}.png"
+                    )
+                    self.data.render_frame(
+                        source, frame_path,
+                        slot_start, slot_end,
+                        product, size,
+                    )
+
+            self.root.after(
+                0,
+                lambda: self.panel.set_status(
+                    "Download complete."
+                ),
+            )
+        except Exception as e:
+            self.root.after(
+                0,
+                lambda: self.panel.set_status(
+                    f"ERROR: {e}"
+                ),
+            )
+        finally:
+            self._busy = False
+
+    def _worker_video(self):
+        """Background worker: create MP4 and load into player."""
+        try:
+            day = date.fromisoformat(
+                self.panel.var_date.get()
+            )
+            samples = self.panel.var_samples.get()
+            fps = self.panel.var_fps.get()
+
+            fdir = self.data.frames_dir(day, samples)
+            vpath = self.data.video_path(
+                day, samples, fps
+            )
+
+            self.data.create_video(
+                fdir, vpath, samples, fps
+            )
+
+            self.root.after(
+                0,
+                lambda: self.player.load_video(vpath),
+            )
+            self.root.after(
+                0,
+                lambda: self.panel.set_status(
+                    f"Video ready: {vpath.name}"
+                ),
+            )
+        except Exception as e:
+            self.root.after(
+                0,
+                lambda: self.panel.set_status(
+                    f"ERROR: {e}"
+                ),
+            )
+        finally:
+            self._busy = False
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        raise SystemExit("\nInterrupted by user.")
-    except Exception as error:
-        raise SystemExit(f"\nERROR: {error}")
+    app = SmileUviApp()
+    app.run()

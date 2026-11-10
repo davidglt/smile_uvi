@@ -768,14 +768,26 @@ class SmileUviApp:
                     ),
                 )
 
+                total_slots = len(selected)
+                downloaded = 0
                 for slot, product in sorted(
                     selected.items()
                 ):
                     dest = odir / product["filename"]
                     if valid_png(dest):
+                        downloaded += 1
                         continue
                     self.data.download_product(
                         session, product, odir,
+                    )
+                    downloaded += 1
+                    self.root.after(
+                        0,
+                        lambda d=downloaded, t=total_slots,
+                        f=product["filename"]:
+                        self.panel.set_status(
+                            f"Downloading {d}/{t}: {f}"
+                        ),
                     )
 
                 fdir = self.data.frames_dir(day, samples)
@@ -808,11 +820,20 @@ class SmileUviApp:
                         slot_start, slot_end,
                         product, size,
                     )
+                    self.root.after(
+                        0,
+                        lambda s=slot + 1, n=samples:
+                        self.panel.set_status(
+                            f"Rendering frame {s}/{n}..."
+                        ),
+                    )
 
             self.root.after(
                 0,
                 lambda: self.panel.set_status(
-                    "Download complete."
+                    f"Download complete. "
+                    f"{total_slots} slots, "
+                    f"{samples} frames rendered."
                 ),
             )
         except Exception as e:

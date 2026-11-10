@@ -533,6 +533,7 @@ class ControlPanel(ttk.Frame):
     def __init__(self, parent, app: "SmileUviApp"):
         super().__init__(parent, padding=10)
         self.app = app
+        self._marked = set()
         self._build()
 
     def _build(self):
@@ -628,10 +629,22 @@ class ControlPanel(ttk.Frame):
             "<<TreeviewSelect>>", self._on_catalog_select
         )
 
+        btn_row = ttk.Frame(bottom)
+        btn_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(
-            bottom, text="Refresh",
+            btn_row, text="Refresh",
             command=self.refresh_catalog,
-        ).pack(anchor=tk.E, pady=(4, 0))
+        ).pack(side=tk.LEFT, padx=2)
+        self.btn_mark = ttk.Button(
+            btn_row, text="Mark",
+            command=self._on_mark,
+        )
+        self.btn_mark.pack(side=tk.LEFT, padx=2)
+        self.btn_delete = ttk.Button(
+            btn_row, text="Delete",
+            command=self._on_delete,
+        )
+        self.btn_delete.pack(side=tk.LEFT, padx=2)
 
     def _on_download(self):
         """Trigger the download workflow."""
@@ -662,11 +675,18 @@ class ControlPanel(ttk.Frame):
             day_str = parts[2]
             frames_str = parts[3].replace("samples", "")
             fps_str = parts[4].replace("fps", "")
-            self.tree.insert(
+            item_id = self.tree.insert(
                 "", tk.END,
                 values=(day_str, frames_str, fps_str),
                 tags=(str(mp4),),
             )
+            if item_id in self._marked:
+                self.tree.item(
+                    item_id,
+                    tags=(str(mp4), "marked"),
+                    values=("\u2605 " + day_str,
+                            frames_str, fps_str),
+                )
 
     def _on_catalog_select(self, event):
         """Load the selected video into the player."""
@@ -677,6 +697,53 @@ class ControlPanel(ttk.Frame):
         video_path = Path(item["tags"][0])
         self.app.player.load_video(video_path)
         self.app.player.toggle_play()
+
+    def _on_mark(self):
+        """Toggle the marked state on selected catalog items."""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        for item_id in sel:
+            item = self.tree.item(item_id)
+            tags = list(item["tags"])
+            values = list(item["values"])
+            video_path = item["tags"][0] if item["tags"] else None
+            if "marked" in tags:
+                tags.remove("marked")
+                values[0] = values[0].lstrip("\u2605 ")
+                if video_path:
+                    self._marked.discard(video_path)
+            else:
+                tags.append("marked")
+                values[0] = "\u2605 " + values[0]
+                if video_path:
+                    self._marked.add(video_path)
+            self.tree.item(item_id, tags=tags, values=values)
+
+    def _on_delete(self):
+        """Delete selected video files from disk and the catalog."""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        paths = []
+        for item_id in sel:
+            item = self.tree.item(item_id)
+            if item["tags"]:
+                paths.append(Path(item["tags"][0]))
+        if not paths:
+            return
+        if not messagebox.askyesno(
+            "Confirm Delete",
+            f"Delete {len(paths)} video(s)?\n"
+            "This cannot be undone.",
+        ):
+            return
+        for p in paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.refresh_catalog()
 
 
 class SmileUviApp:

@@ -605,14 +605,17 @@ class ControlPanel(ttk.Frame):
             anchor=tk.W
         )
 
-        cols = ("day", "frames", "fps")
+        cols = ("check", "day", "frames", "fps")
         self.tree = ttk.Treeview(
             bottom, columns=cols, show="headings",
             height=10,
         )
+        self.tree.heading("check", text="")
         self.tree.heading("day", text="Day")
         self.tree.heading("frames", text="Frames")
         self.tree.heading("fps", text="FPS")
+        self.tree.column("check", width=30, anchor=tk.CENTER,
+                         stretch=False)
         self.tree.column("day", width=100, anchor=tk.CENTER)
         self.tree.column("frames", width=60, anchor=tk.CENTER)
         self.tree.column("fps", width=40, anchor=tk.CENTER)
@@ -635,16 +638,13 @@ class ControlPanel(ttk.Frame):
             btn_row, text="Refresh",
             command=self.refresh_catalog,
         ).pack(side=tk.LEFT, padx=2)
-        self.btn_mark = ttk.Button(
-            btn_row, text="Mark",
-            command=self._on_mark,
-        )
-        self.btn_mark.pack(side=tk.LEFT, padx=2)
         self.btn_delete = ttk.Button(
             btn_row, text="Delete",
             command=self._on_delete,
         )
         self.btn_delete.pack(side=tk.LEFT, padx=2)
+
+        self.tree.bind("<Button-1>", self._on_tree_click)
 
     def _on_download(self):
         """Trigger the download workflow."""
@@ -672,21 +672,16 @@ class ControlPanel(ttk.Frame):
             parts = mp4.stem.split("_")
             if len(parts) < 5:
                 continue
-            day_str = parts[2]
-            frames_str = parts[3].replace("samples", "")
-            fps_str = parts[4].replace("fps", "")
-            item_id = self.tree.insert(
+            day_str = str(parts[2])
+            frames_str = str(parts[3].replace("samples", ""))
+            fps_str = str(parts[4].replace("fps", ""))
+            path_str = str(mp4)
+            check = "\u2611" if path_str in self._marked else "\u2610"
+            self.tree.insert(
                 "", tk.END,
-                values=(day_str, frames_str, fps_str),
-                tags=(str(mp4),),
+                values=(check, day_str, frames_str, fps_str),
+                tags=(path_str,),
             )
-            if item_id in self._marked:
-                self.tree.item(
-                    item_id,
-                    tags=(str(mp4), "marked"),
-                    values=("\u2605 " + day_str,
-                            frames_str, fps_str),
-                )
 
     def _on_catalog_select(self, event):
         """Load the selected video into the player."""
@@ -698,27 +693,26 @@ class ControlPanel(ttk.Frame):
         self.app.player.load_video(video_path)
         self.app.player.toggle_play()
 
-    def _on_mark(self):
-        """Toggle the marked state on selected catalog items."""
-        sel = self.tree.selection()
-        if not sel:
+    def _on_tree_click(self, event):
+        """Toggle the checkbox when the check column is clicked."""
+        col = self.tree.identify_column(event.x)
+        if col != "#1":
             return
-        for item_id in sel:
-            item = self.tree.item(item_id)
-            tags = list(item["tags"])
-            values = list(item["values"])
-            video_path = item["tags"][0] if item["tags"] else None
-            if "marked" in tags:
-                tags.remove("marked")
-                values[0] = values[0].lstrip("\u2605 ")
-                if video_path:
-                    self._marked.discard(video_path)
-            else:
-                tags.append("marked")
-                values[0] = "\u2605 " + values[0]
-                if video_path:
-                    self._marked.add(video_path)
-            self.tree.item(item_id, tags=tags, values=values)
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        item = self.tree.item(row)
+        values = list(item["values"])
+        path_str = item["tags"][0] if item["tags"] else None
+        if values[0] == "\u2611":
+            values[0] = "\u2610"
+            if path_str:
+                self._marked.discard(path_str)
+        else:
+            values[0] = "\u2611"
+            if path_str:
+                self._marked.add(path_str)
+        self.tree.item(row, values=values)
 
     def _on_delete(self):
         """Delete selected video files from disk and the catalog."""
@@ -729,7 +723,7 @@ class ControlPanel(ttk.Frame):
         for item_id in sel:
             item = self.tree.item(item_id)
             if item["tags"]:
-                paths.append(Path(item["tags"][0]))
+                paths.append(Path(str(item["tags"][0])))
         if not paths:
             return
         if not messagebox.askyesno(

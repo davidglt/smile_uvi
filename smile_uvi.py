@@ -436,6 +436,7 @@ class VideoPlayerWidget(ttk.Frame):
         self._width = width
         self._height = height
         self._photo = None
+        self._video_path = None
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, pady=(4, 0))
@@ -457,6 +458,7 @@ class VideoPlayerWidget(ttk.Frame):
             )
             return
         self._cap = cv2.VideoCapture(str(path))
+        self._video_path = path
         if not self._cap.isOpened():
             self.lbl_status.config(text="Failed to open video")
             self._cap = None
@@ -469,11 +471,21 @@ class VideoPlayerWidget(ttk.Frame):
 
     def toggle_play(self):
         """Toggle play/pause of the loaded video."""
-        if self._cap is None:
+        if self._video_path is None:
             return
         if self._playing:
             self.stop()
         else:
+            if self._cap is None:
+                self._cap = cv2.VideoCapture(
+                    str(self._video_path)
+                )
+                if not self._cap.isOpened():
+                    self.lbl_status.config(
+                        text="Failed to reopen video"
+                    )
+                    self._cap = None
+                    return
             self._playing = True
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self._tick()
@@ -486,7 +498,6 @@ class VideoPlayerWidget(ttk.Frame):
             self._after_id = None
         if self._cap:
             self._cap.release()
-            self._cap = None
         self.canvas.delete("all")
         self._photo = None
 
@@ -526,43 +537,47 @@ class ControlPanel(ttk.Frame):
 
     def _build(self):
         """Build all form widgets."""
-        ttk.Label(self, text="Date (YYYY-MM-DD):").pack(
+        # --- Top section: generation options ---
+        top = ttk.Frame(self)
+        top.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(top, text="Date (YYYY-MM-DD):").pack(
             anchor=tk.W
         )
         self.var_date = tk.StringVar(
             value=date.today().isoformat()
         )
         ttk.Entry(
-            self, textvariable=self.var_date, width=14
+            top, textvariable=self.var_date, width=14
         ).pack(anchor=tk.W, pady=(2, 8))
 
-        ttk.Label(self, text="Number of frames:").pack(
+        ttk.Label(top, text="Number of frames:").pack(
             anchor=tk.W
         )
         self.var_samples = tk.IntVar(value=24)
         ttk.Spinbox(
-            self, from_=1, to=86400,
+            top, from_=1, to=86400,
             textvariable=self.var_samples, width=10,
         ).pack(anchor=tk.W, pady=(2, 8))
 
-        ttk.Label(self, text="Video FPS:").pack(anchor=tk.W)
+        ttk.Label(top, text="Video FPS:").pack(anchor=tk.W)
         self.var_fps = tk.IntVar(value=1)
         ttk.Spinbox(
-            self, from_=1, to=60,
+            top, from_=1, to=60,
             textvariable=self.var_fps, width=10,
         ).pack(anchor=tk.W, pady=(2, 8))
 
-        ttk.Label(self, text="Filename prefix:").pack(
+        ttk.Label(top, text="Filename prefix:").pack(
             anchor=tk.W
         )
         self.var_prefix = tk.StringVar(
             value="SMILE_UVI_QL_AURORA_"
         )
         ttk.Entry(
-            self, textvariable=self.var_prefix, width=28,
+            top, textvariable=self.var_prefix, width=28,
         ).pack(anchor=tk.W, pady=(2, 8))
 
-        btn_frame = ttk.Frame(self)
+        btn_frame = ttk.Frame(top)
         btn_frame.pack(fill=tk.X, pady=(8, 4))
         self.btn_download = ttk.Button(
             btn_frame, text="Download",
@@ -577,25 +592,46 @@ class ControlPanel(ttk.Frame):
 
         self.var_status = tk.StringVar(value="Ready")
         ttk.Label(
-            self, textvariable=self.var_status,
+            top, textvariable=self.var_status,
             wraplength=280, justify=tk.LEFT,
         ).pack(fill=tk.X, pady=(8, 4))
 
-        ttk.Label(
-            self, text="Telemetry / Catalogue:"
-        ).pack(anchor=tk.W, pady=(8, 2))
-        self.txt_tel = tk.Text(
-            self, height=12, width=36,
-            font=("Consolas", 9),
+        # --- Bottom section: video catalog ---
+        bottom = ttk.Frame(self)
+        bottom.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        ttk.Label(bottom, text="Video Catalog:").pack(
+            anchor=tk.W
         )
-        scroll = ttk.Scrollbar(
-            self, command=self.txt_tel.yview
+
+        cols = ("day", "frames", "fps")
+        self.tree = ttk.Treeview(
+            bottom, columns=cols, show="headings",
+            height=10,
         )
-        self.txt_tel.configure(yscrollcommand=scroll.set)
-        self.txt_tel.pack(
-            side=tk.LEFT, fill=tk.BOTH, expand=True
+        self.tree.heading("day", text="Day")
+        self.tree.heading("frames", text="Frames")
+        self.tree.heading("fps", text="FPS")
+        self.tree.column("day", width=100, anchor=tk.CENTER)
+        self.tree.column("frames", width=60, anchor=tk.CENTER)
+        self.tree.column("fps", width=40, anchor=tk.CENTER)
+
+        tree_scroll = ttk.Scrollbar(
+            bottom, orient=tk.VERTICAL,
+            command=self.tree.yview,
         )
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.bind(
+            "<<TreeviewSelect>>", self._on_catalog_select
+        )
+
+        ttk.Button(
+            bottom, text="Refresh",
+            command=self.refresh_catalog,
+        ).pack(anchor=tk.E, pady=(4, 0))
 
     def _on_download(self):
         """Trigger the download workflow."""
@@ -610,14 +646,37 @@ class ControlPanel(ttk.Frame):
         self.var_status.set(text)
 
     def set_telemetry(self, rows: list):
-        """Populate the telemetry text widget with rows."""
-        self.txt_tel.delete("1.0", tk.END)
-        for r in rows:
-            self.txt_tel.insert(
-                tk.END,
-                f"{r['time']}  {r['file']}  "
-                f"v{r['version']}\n",
+        """No-op kept for backward compatibility."""
+        pass
+
+    def refresh_catalog(self):
+        """Scan the data directory for generated MP4 videos."""
+        self.tree.delete(*self.tree.get_children())
+        data_root = self.app.data.output_root
+        if not data_root.is_dir():
+            return
+        for mp4 in sorted(data_root.rglob("*.mp4")):
+            parts = mp4.stem.split("_")
+            if len(parts) < 5:
+                continue
+            day_str = parts[2]
+            frames_str = parts[3].replace("samples", "")
+            fps_str = parts[4].replace("fps", "")
+            self.tree.insert(
+                "", tk.END,
+                values=(day_str, frames_str, fps_str),
+                tags=(str(mp4),),
             )
+
+    def _on_catalog_select(self, event):
+        """Load the selected video into the player."""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        item = self.tree.item(sel[0])
+        video_path = Path(item["tags"][0])
+        self.app.player.load_video(video_path)
+        self.app.player.toggle_play()
 
 
 class SmileUviApp:
@@ -645,6 +704,7 @@ class SmileUviApp:
         main.add(self.panel, weight=2)
 
         self._busy = False
+        self.panel.refresh_catalog()
 
     def run(self):
         """Start the tkinter main loop."""
@@ -694,13 +754,6 @@ class SmileUviApp:
                 )
                 selected = self.data.select_samples(
                     products, start, samples, prefix,
-                )
-
-                self.root.after(
-                    0,
-                    lambda: self.panel.set_telemetry(
-                        self.data.get_telemetry(products),
-                    ),
                 )
 
                 cached = self.data.get_cached_files(
@@ -799,6 +852,7 @@ class SmileUviApp:
                     f"Video ready: {vpath.name}"
                 ),
             )
+            self.root.after(0, self.panel.refresh_catalog)
         except Exception as e:
             error_msg = f"ERROR: {e}"
             self.root.after(

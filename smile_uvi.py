@@ -31,7 +31,7 @@ BASE_URL = "https://emds.esac.esa.int/service"
 TABLE = "smile.v_ql_data_file_latest"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_RECORDS = 100000
-__version__ = "1.0"
+__version__ = "1.1"
 
 
 def adql_string(value):

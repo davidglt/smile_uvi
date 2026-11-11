@@ -6,15 +6,25 @@ A desktop GUI tool that downloads daily Ultra-Violet Imager (UVI) quick-look
 PNG frames from the ESA SMILE mission archive, renders annotated frames,
 and produces a short MP4 video for quick visual inspection.
 
+**Version:** 1.1
+
 ## Features
 
 - **Query** the ESA EMDs TAP service for UVI products on a given UTC day.
-- **Download** one representative PNG per time slot (configurable count).
-- **Render** annotated frames (timestamp, observation time, filename).
-- **Create** an MP4 video from the rendered frames via OpenCV.
-- **Play** the resulting video in a built-in OpenCV-based player with
-  seek, play/pause, and frame-skip controls.
+- **Filter** results by an optional filename prefix before slot selection.
+- **Download** one representative PNG per time slot (configurable count),
+  with automatic HTTP retry and PNG integrity validation (magic-byte check
+  plus Pillow `verify()`).
+- **Render** annotated frames (slot time range, observation timestamp,
+  filename).
+- **Create** an MP4 video from the rendered frames via OpenCV
+  (`cv2.VideoWriter`, `mp4v` codec) — no external codec binary required.
+- **Play** the resulting video in a built-in OpenCV-based player
+  (`cv2.VideoCapture`) with seek bar, Play/Pause, Stop, and frame-skip
+  (±5) controls.
 - **Catalogue** all previously generated videos with bulk delete.
+- **About** dialog showing version, author, license, and a button to open
+  the LICENSE file.
 
 ## Requirements
 
@@ -79,10 +89,21 @@ data/
 └── YYYYMMDD/
     ├── originals/          # downloaded PNGs
     ├── frames_Nsamples/    # rendered annotated frames
+    ├── manifest_Nsamples.csv
     └── smile_uvi_YYYYMMDD_Nsamples_Ffps.mp4
 ```
+
+## Architecture
+
+| Module | Role |
+|---|---|
+| `smile_uvi.py` | GUI (tkinter), HTTP session, download, render, video, player |
+| `smile_sampling.py` | Timestamp parsing and per-slot sample selection |
+
+Video encoding and playback are handled entirely by **OpenCV**; no external
+codec binary (e.g. ffmpeg) is required at runtime.
 
 ## License
 
 This project is licensed under the GNU General Public License v3.0 or
-later - see the LICENSE file for details.
+later - see the [LICENSE](LICENSE) file for details.

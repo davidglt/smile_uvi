@@ -21,11 +21,12 @@ from requests.adapters import HTTPAdapter
 from tkinter import ttk, messagebox
 from urllib3.util.retry import Retry
 
+from smile_sampling import DAY_SECONDS, parse_timestamp, select_samples
+
 
 BASE_URL = "https://emds.esac.esa.int/service"
 TABLE = "smile.v_ql_data_file_latest"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-DAY_SECONDS = 86400
 MAX_RECORDS = 100000
 __version__ = "1.0"
 
@@ -33,16 +34,6 @@ __version__ = "1.0"
 def adql_string(value):
     """Escape a value for use in an ADQL string literal."""
     return "'" + str(value).replace("'", "''") + "'"
-
-
-def parse_timestamp(value):
-    """Parse an ISO-8601 timestamp string into a UTC-aware datetime."""
-    timestamp = datetime.fromisoformat(
-        value.strip().replace("Z", "+00:00")
-    )
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    return timestamp.astimezone(timezone.utc)
 
 
 def make_session():
@@ -180,43 +171,7 @@ class SmileUviData:
         self, products, start, sample_count, prefix
     ) -> dict:
         """Select one product per time slot from the product list."""
-        selected = {}
-
-        for product in products:
-            if prefix and not product["filename"].startswith(prefix):
-                continue
-
-            timestamp = parse_timestamp(product["begin_time"])
-            elapsed = timestamp - start
-            elapsed_us = (
-                elapsed.days * DAY_SECONDS * 1_000_000
-                + elapsed.seconds * 1_000_000
-                + elapsed.microseconds
-            )
-
-            if not 0 <= elapsed_us < DAY_SECONDS * 1_000_000:
-                continue
-
-            slot = (
-                elapsed_us * sample_count
-                // (DAY_SECONDS * 1_000_000)
-            )
-
-            previous = selected.get(slot)
-            if previous is None:
-                selected[slot] = product
-                continue
-
-            previous_time = parse_timestamp(previous["begin_time"])
-            if timestamp < previous_time:
-                selected[slot] = product
-            elif timestamp == previous_time:
-                if (product["item_version"] or "") > (
-                    previous["item_version"] or ""
-                ):
-                    selected[slot] = product
-
-        return selected
+        return select_samples(products, start, sample_count, prefix)
 
     def download_product(
         self, session, product, originals_dir

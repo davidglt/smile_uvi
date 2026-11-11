@@ -8,7 +8,6 @@
 
 import csv
 import io
-import subprocess
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -30,10 +29,12 @@ MAX_RECORDS = 100000
 
 
 def adql_string(value):
+    """Escape a value for use in an ADQL string literal."""
     return "'" + str(value).replace("'", "''") + "'"
 
 
 def parse_timestamp(value):
+    """Parse an ISO-8601 timestamp string into a UTC-aware datetime."""
     timestamp = datetime.fromisoformat(
         value.strip().replace("Z", "+00:00")
     )
@@ -43,6 +44,7 @@ def parse_timestamp(value):
 
 
 def make_session():
+    """Create a requests.Session with retry and a custom User-Agent."""
     session = requests.Session()
     retry = Retry(
         total=4,
@@ -57,6 +59,7 @@ def make_session():
 
 
 def valid_png(path):
+    """Return True if *path* exists and is a valid PNG file."""
     if not path.is_file():
         return False
 
@@ -71,6 +74,7 @@ def valid_png(path):
 
 
 def get_font(size):
+    """Return a TrueType font at *size*, falling back to the default."""
     for name in ("DejaVuSans.ttf", "arial.ttf"):
         try:
             return ImageFont.truetype(name, size)
@@ -80,6 +84,7 @@ def get_font(size):
 
 
 def draw_fitted_text(draw, position, text, font, max_width):
+    """Draw *text* at *position*, truncating with '...' if it exceeds *max_width*."""
     if draw.textbbox((0, 0), text, font=font)[2] > max_width:
         while text and (
             draw.textbbox((0, 0), text + "...", font=font)[2]
@@ -95,6 +100,7 @@ class SmileUviData:
     """Data layer: query, download, cache, render, and video creation."""
 
     def __init__(self, output_root: Path):
+        """Initialise the data layer with the root output directory."""
         self.output_root = output_root
 
     def day_dir(self, day: date) -> Path:
@@ -370,40 +376,62 @@ class SmileUviData:
     def create_video(
         self, frames_dir, destination, sample_count, fps
     ) -> None:
-        """Create an MP4 video from rendered frames using FFmpeg."""
+        """Create an MP4 video from rendered frames using OpenCV."""
         temporary = destination.with_name(
             destination.stem + ".part.mp4"
         )
-
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-y",
-            "-framerate", str(fps),
-            "-start_number", "0",
-            "-i", str(frames_dir / "frame_%06d.png"),
-            "-frames:v", str(sample_count),
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            str(temporary),
-        ]
+        writer = None
 
         try:
-            subprocess.run(command, check=True)
+            first_frame_path = frames_dir / "frame_000000.png"
+            if not first_frame_path.is_file():
+                raise RuntimeError(
+                    f"First frame not found: {first_frame_path}"
+                )
+
+            first_frame = cv2.imread(str(first_frame_path))
+            if first_frame is None:
+                raise RuntimeError(
+                    f"Could not read first frame: {first_frame_path}"
+                )
+
+            height, width = first_frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(
+                str(temporary), fourcc, float(fps),
+                (width, height),
+            )
+
+            if not writer.isOpened():
+                raise RuntimeError(
+                    "OpenCV VideoWriter failed to open output."
+                )
+
+            for i in range(sample_count):
+                frame_path = frames_dir / f"frame_{i:06d}.png"
+                frame = cv2.imread(str(frame_path))
+                if frame is None:
+                    raise RuntimeError(
+                        f"Could not read frame: {frame_path}"
+                    )
+                writer.write(frame)
+
+            # Release the writer before renaming (Windows file lock).
+            writer.release()
+            writer = None
 
             if (
                 not temporary.is_file()
                 or temporary.stat().st_size == 0
             ):
                 raise RuntimeError(
-                    "FFmpeg did not create a valid output file."
+                    "OpenCV did not create a valid output file."
                 )
 
             temporary.replace(destination)
         finally:
+            if writer is not None:
+                writer.release()
             temporary.unlink(missing_ok=True)
 
     def get_cached_files(self, day: date, samples: int) -> list:
@@ -429,6 +457,7 @@ class VideoPlayerWidget(ttk.Frame):
     """Plays an MP4 file using OpenCV on a tkinter Canvas."""
 
     def __init__(self, parent, width=640, height=480):
+        """Build the canvas, seek bar, and transport controls."""
         super().__init__(parent)
         self.canvas = tk.Canvas(
             self, width=width, height=height,
@@ -647,6 +676,7 @@ class ControlPanel(ttk.Frame):
     """Right-side form: date, params, telemetry, action buttons."""
 
     def __init__(self, parent, app: "SmileUviApp"):
+        """Build the right-side form with date, params, and video catalog."""
         super().__init__(parent, padding=10)
         self.app = app
         self._marked = set()
@@ -873,6 +903,7 @@ class SmileUviApp:
     """Main application window wiring all components together."""
 
     def __init__(self):
+        """Create the main window, data layer, player, and control panel."""
         self.root = tk.Tk()
         self.root.title("SMILE UVI - Daily Sampler")
         self.root.geometry("1100x700")

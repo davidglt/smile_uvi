@@ -24,15 +24,16 @@ and produces a short MP4 video for quick visual inspection.
 | requests | ≥ 2.28 |
 | Pillow | ≥ 9.0 |
 | opencv-python | ≥ 4.5 |
-| FFmpeg | any recent build (on `PATH`) |
 
-Install Python dependencies:
+## Installation
 
 ```bash
+git clone https://github.com/davidglt/smile-uvi.git
+cd smile-uvi
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
-
-Make sure `ffmpeg` is installed and available on your system `PATH`.
 
 ## Usage
 

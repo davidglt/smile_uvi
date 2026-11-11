@@ -8,6 +8,8 @@
 
 import csv
 import io
+import shutil
+import sys
 import threading
 import time
 import webbrowser
@@ -88,6 +90,39 @@ def draw_fitted_text(draw, position, text, font, max_width):
         text += "..."
 
     draw.text(position, text, fill="white", font=font)
+
+
+def _on_mousewheel(event, widget):
+    """Handle mouse wheel / trackpad scroll with macOS normalization."""
+    if sys.platform == "darwin":
+        delta = -1 * event.delta
+    else:
+        delta = -1 * int(event.delta / 120)
+    widget.yview_scroll(delta, "units")
+
+
+def _bind_scroll(widget):
+    """Bind scroll events to *widget* only while the cursor is over it."""
+    def _on_enter(_event):
+        widget.bind_all(
+            "<MouseWheel>",
+            lambda e: _on_mousewheel(e, widget),
+        )
+        widget.bind_all(
+            "<Shift-MouseWheel>",
+            lambda e: widget.xview_scroll(
+                -1 * e.delta if sys.platform == "darwin"
+                else -1 * int(e.delta / 120),
+                "units",
+            ),
+        )
+
+    def _on_leave(_event):
+        widget.unbind_all("<MouseWheel>")
+        widget.unbind_all("<Shift-MouseWheel>")
+
+    widget.bind("<Enter>", _on_enter)
+    widget.bind("<Leave>", _on_leave)
 
 
 class SmileUviData:
@@ -732,6 +767,7 @@ class ControlPanel(ttk.Frame):
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        _bind_scroll(self.tree)
 
         self.tree.bind(
             "<<TreeviewSelect>>", self._on_catalog_select
@@ -822,7 +858,7 @@ class ControlPanel(ttk.Frame):
         self.tree.item(row, values=values)
 
     def _on_delete(self):
-        """Delete checked or selected video files from disk."""
+        """Delete the day directory (and all contents) for checked/selected videos."""
         paths = set(self._marked)
         sel = self.tree.selection()
         for item_id in sel:
@@ -835,25 +871,37 @@ class ControlPanel(ttk.Frame):
                 "Check or select a video first.",
             )
             return
+
+        # Derive the day directory for each video (mp4.parent)
+        day_dirs = sorted({Path(p).parent for p in paths})
+        day_names = ", ".join(d.name for d in day_dirs)
+
         if not messagebox.askyesno(
             "Confirm Delete",
-            f"Delete {len(paths)} video(s)?\n"
+            f"Delete {len(day_dirs)} day folder(s) and ALL contents?\n"
+            f"Folders: {day_names}\n"
             "This cannot be undone.",
         ):
             return
+
         # Release the video file handle before deleting
         self.app.player.stop()
 
-        for p_str in paths:
-            p = Path(p_str)
+        errors = []
+        for d in day_dirs:
             try:
-                if p.is_file():
-                    p.unlink()
+                if d.is_dir():
+                    shutil.rmtree(d)
             except OSError as e:
-                messagebox.showerror(
-                    "Delete",
-                    f"Failed to delete {p.name}:\n{e}",
-                )
+                errors.append(f"{d.name}: {e}")
+
+        if errors:
+            messagebox.showerror(
+                "Delete",
+                "Some folders could not be deleted:\n"
+                + "\n".join(errors),
+            )
+
         self._marked.clear()
         self.refresh_catalog()
 
@@ -867,6 +915,12 @@ class SmileUviApp:
         self.root.title("SMILE UVI - Daily Sampler")
         self.root.geometry("1100x700")
         self.root.minsize(900, 550)
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after_idle(
+            self.root.attributes, "-topmost", False
+        )
+        self.root.focus_force()
 
         # Top bar: About button
         top_bar = ttk.Frame(self.root)

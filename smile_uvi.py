@@ -9,6 +9,7 @@
 import csv
 import io
 import threading
+import time
 import webbrowser
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -626,6 +627,7 @@ class VideoPlayerWidget(ttk.Frame):
         delay = int(
             1000 / max(self._cap.get(cv2.CAP_PROP_FPS), 1)
         )
+        self.update_idletasks()
         self._after_id = self.after(delay, self._tick)
 
 
@@ -1024,6 +1026,7 @@ class SmileUviApp:
                         session, product, odir,
                     )
                     downloaded += 1
+                    time.sleep(0.01)
                     self.root.after(
                         0,
                         lambda d=downloaded, t=total_slots,
@@ -1063,6 +1066,7 @@ class SmileUviApp:
                         slot_start, slot_end,
                         product, size,
                     )
+                    time.sleep(0.01)
                     self.root.after(
                         0,
                         lambda s=slot + 1, n=samples:
@@ -1105,6 +1109,7 @@ class SmileUviApp:
             self.data.create_video(
                 fdir, vpath, samples, fps
             )
+            time.sleep(0.01)
 
             self.root.after(
                 0,

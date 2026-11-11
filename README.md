@@ -11,7 +11,7 @@ and produces a short MP4 video for quick visual inspection.
 - **Query** the ESA EMDs TAP service for UVI products on a given UTC day.
 - **Download** one representative PNG per time slot (configurable count).
 - **Render** annotated frames (timestamp, observation time, filename).
-- **Create** an MP4 video from the rendered frames via FFmpeg.
+- **Create** an MP4 video from the rendered frames via OpenCV.
 - **Play** the resulting video in a built-in OpenCV-based player with
   seek, play/pause, and frame-skip controls.
 - **Catalogue** all previously generated videos with bulk delete.

@@ -13,9 +13,29 @@ DAY_SECONDS = 86400
 
 def parse_timestamp(value):
     """Parse an ISO-8601 timestamp string into a UTC-aware datetime."""
-    timestamp = datetime.fromisoformat(
-        value.strip().replace("Z", "+00:00")
-    )
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        timestamp = datetime.fromisoformat(text)
+    except ValueError:
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f%z",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                timestamp = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(
+                f"Cannot parse timestamp: {value!r}"
+            )
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
     return timestamp.astimezone(timezone.utc)

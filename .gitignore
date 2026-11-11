@@ -1,0 +1,10 @@
+.aider*
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+
+# Keep the data directory marker, not downloaded/generated media.
+/data/*
+!/data/.gitkeep

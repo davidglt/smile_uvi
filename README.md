@@ -27,11 +27,32 @@ and produces a short MP4 video for quick visual inspection.
 
 ## Installation
 
+### 1. Clone the repository
+
 ```bash
 git clone https://github.com/davidglt/smile-uvi.git
 cd smile-uvi
-python -m venv .venv
+```
+
+### 2. Create and activate a virtual environment
+
+**Linux / macOS**
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
+```
+
+**Windows (PowerShell or CMD)**
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+### 3. Install dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 

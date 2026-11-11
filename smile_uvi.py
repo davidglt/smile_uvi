@@ -9,6 +9,7 @@
 import csv
 import io
 import threading
+import webbrowser
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +27,7 @@ TABLE = "smile.v_ql_data_file_latest"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DAY_SECONDS = 86400
 MAX_RECORDS = 100000
+__version__ = "1.0"
 
 
 def adql_string(value):
@@ -909,6 +911,14 @@ class SmileUviApp:
         self.root.geometry("1100x700")
         self.root.minsize(900, 550)
 
+        # Top bar: About button
+        top_bar = ttk.Frame(self.root)
+        top_bar.pack(fill=tk.X, side=tk.TOP)
+        ttk.Button(
+            top_bar, text="About",
+            command=self._show_about,
+        ).pack(side=tk.RIGHT, padx=8, pady=4)
+
         self.data = SmileUviData(output_root=Path("data"))
 
         main = ttk.PanedWindow(
@@ -930,6 +940,63 @@ class SmileUviApp:
     def run(self):
         """Start the tkinter main loop."""
         self.root.mainloop()
+
+    def _show_about(self):
+        """Show the About dialog with credits and license info."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("About SMILE UVI")
+        dlg.geometry("420x320")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(
+            dlg, text="SMILE UVI – Daily Sampler",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(pady=(16, 4))
+        ttk.Label(
+            dlg,
+            text=(
+                "Download daily UVI quick-look frames from the\n"
+                "ESA SMILE mission archive, render annotated\n"
+                "frames, and produce a short MP4 video."
+            ),
+            justify=tk.CENTER,
+        ).pack(pady=(0, 12))
+
+        ttk.Label(
+            dlg,
+            text=(
+                f"Version: v{__version__}\n"
+                "Author: David González López-Tercero\n"
+                "Email: davidglt@dragonit.es\n"
+                "License: GPL-3.0-or-later"
+            ),
+            justify=tk.CENTER,
+        ).pack(pady=(0, 16))
+
+        def _open_license():
+            license_path = Path(__file__).parent / "LICENSE"
+            if license_path.is_file():
+                webbrowser.open(
+                    f"file://{license_path.resolve().as_posix()}"
+                )
+            else:
+                messagebox.showwarning(
+                    "About",
+                    "LICENSE file not found.",
+                    parent=dlg,
+                )
+
+        ttk.Button(
+            dlg, text="View LICENSE",
+            command=_open_license,
+        ).pack(pady=(0, 8))
+
+        ttk.Button(
+            dlg, text="Close",
+            command=dlg.destroy,
+        ).pack(pady=(0, 12))
 
     def start_download(self):
         """Begin the download workflow in a background thread."""

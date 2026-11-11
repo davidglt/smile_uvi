@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Created: 2025-07-11
+# Created: 2026-11-10
 # Author: David González López-Tercero <davidglt@dragonit.es>
 # SPDX-FileCopyrightText: 2026 David González López-Tercero <davidglt@dragonit.es>
 # SPDX-License-Identifier: GPL-3.0-or-later
